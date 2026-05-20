@@ -1,0 +1,57 @@
+# yolo_world_rbnx — open-vocabulary object detection service.
+#
+# The ONLY GPU/ML package in the piper grasp pipeline. Wraps ultralytics
+# YOLOE (the prompt-free, open-vocabulary YOLO-World variant) running on
+# CUDA. Owns `robonix/service/perception/object_detect/*`.
+#
+# Two-surface design:
+#   * NEW   atlas-routed MCP    object_detect/detect_object  (Pilot's view)
+#   * OLD   ROS service         /yolo/detect_object          (pick.py + yolo_grasp.py)
+#   Both share one detection function; killing the ROS path is a
+#   Stage 6 cutover (when pick_skill_rbnx switches to atlas).
+#
+# Lifecycle:
+#   on_init      — heavy: load YOLOE weights, atlas-resolve camera
+#                  contracts (rgb / depth / camera_info), spawn rclpy
+#                  thread (subscribers + ROS service host + publishers).
+#   on_deactivate — stop rclpy thread; keep model loaded for fast
+#                   re-ACTIVATE.
+#
+# Capability surface (mode = abstract, transport = wire):
+#   service/perception/object_detect/driver         mode=rpc  transport=gRPC  Driver(INIT)
+#   service/perception/object_detect/detect_object  mode=rpc  transport=MCP   DetectObject.srv
+#
+# Config (passed via Driver(CMD_INIT, config_json)):
+#   model_path           default: <pkg>/yolo_world/weights/yoloe-11l-seg-pf.pt
+#                        if missing → ultralytics auto-downloads to ~/.cache
+#   rgb_topic            optional override; default = atlas-resolved or
+#                        /camera/color/image_raw
+#   depth_topic          optional override; default = atlas-resolved or
+#                        /camera/depth/image_raw
+#   camera_info_topic    optional override; default = atlas-resolved or
+#                        /camera/color/camera_info
+#
+# Vendored:
+#   src/graspnet_msgs/   (msg + srv) — colcon build for ROS bindings
+#                        used by both ROS path and the periodic broadcast.
+#   yolo_world/_upstream/object_detection_node.py — original upstream
+#                        single-file node, kept for reference and as
+#                        a side-by-side fallback ('python3 _upstream/
+#                        object_detection_node.py' still works).
+manifestVersion: 1
+
+package:
+  name: com.robonix.piper_grasp.yolo_world
+  version: 0.1.0
+  vendor: robonix
+  description: Open-vocabulary object detection (YOLOE) — atlas + ROS dual surface.
+  license: MulanPSL-2.0
+
+capability_id: yolo_world
+
+build: bash scripts/build.sh
+start: bash scripts/start.sh
+
+capabilities:
+  - name: robonix/service/perception/object_detect/driver
+  - name: robonix/service/perception/object_detect/detect_object

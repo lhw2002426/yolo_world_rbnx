@@ -1,0 +1,24 @@
+# rbnx build artifacts
+rbnx-build/
+
+# YOLO weights — large, downloaded by ultralytics on first run.
+# If you ship a custom checkpoint, comment this out.
+yolo_world/weights/*.pt
+yolo_world/weights/*.engine
+
+# saved annotated images (upstream node writes these in legacy path)
+yolo_world/_upstream/saved_image.jpg
+saved_image.jpg
+
+# python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# editor / OS
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

@@ -1,0 +1,25 @@
+# Detect a named object in the camera view, return its 2D bbox + 3D
+# centroid. Schema is bytes-compatible with upstream
+# graspnet_msgs/srv/ObjectDetectionRequest.srv — only the namespace
+# changes (robonix.perception vs graspnet).
+
+# Request
+string object_name
+---
+# Response
+# 2D bounding box in pixel coords [x_min, y_min, x_max, y_max]
+float64[] bbox_2d
+
+# 3D center position in camera optical frame [x, y, z] meters.
+# Empty if back-projection failed (no valid depth in bbox).
+float64[] object_center_3d
+
+# Detection confidence score (YOLO-World softmax probability).
+float32 confidence
+
+# Success flag (false → no match found at confidence ≥ 0.2 OR
+# upstream camera data not available).
+bool success
+
+# Status / error message.
+string message

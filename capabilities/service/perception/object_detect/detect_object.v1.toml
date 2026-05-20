@@ -1,0 +1,26 @@
+# Detect a named object in the most recent synchronized RGB + depth +
+# camera_info sample, return its 2D bbox + 3D centroid in the camera
+# optical frame. Object name is matched (exact / substring / partial-word)
+# against YOLOE's 4585 prompt-free predefined classes.
+#
+# Implementation: yolo_world_rbnx wraps ultralytics YOLOE (open-vocab YOLO)
+# running on CUDA. Confidence threshold is 0.2; only the highest-confidence
+# match wins. 3D back-projection uses the median depth value inside the
+# 2D bbox (more robust than mean against background pixels) and the
+# camera_info K matrix.
+#
+# IDL: lib/perception/srv/DetectObject.srv (package-local). The schema is
+# bytes-identical to upstream graspnet_msgs/srv/ObjectDetectionRequest.srv
+# (which yolo_grasp_rbnx still calls via ROS), just renamed for the robonix
+# namespace. Both paths share the same detection function.
+[contract]
+id      = "robonix/service/perception/object_detect/detect_object"
+version = "1"
+kind    = "service"
+idl     = "perception/srv/DetectObject.srv"
+
+[mode]
+type = "rpc"
+
+[semantics]
+user_invocable = true
