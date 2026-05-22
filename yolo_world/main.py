@@ -405,6 +405,16 @@ def init(cfg):
             return Err(f"bad config_json: {e}")
 
     # 1. Load YOLOE weights.
+    #
+    # We VENDOR the primary YOLOE-11l prompt-free checkpoint
+    # (yoloe-11l-seg-pf.pt, ~71 MB) under yolo_world/weights/. The
+    # operator can override via config.model_path to point at a
+    # different / larger checkpoint they dropped in there. If the
+    # vendored file is missing AND no override is given, fail loud:
+    # the alternative (silently letting ultralytics download from
+    # the internet at first inference) makes deployment behaviour
+    # depend on whether the deploy host has GitHub access, which is
+    # exactly the kind of magic vendor-by-default is meant to kill.
     pkg_root = Path(os.environ.get(
         "RBNX_PACKAGE_ROOT",
         os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
@@ -412,12 +422,14 @@ def init(cfg):
     weights_default = pkg_root / "yolo_world" / "weights" / "yoloe-11l-seg-pf.pt"
     model_path = cfg.get("model_path") or str(weights_default)
     if not Path(model_path).is_file():
-        # ultralytics will auto-download to ~/.cache, but log a warning so
-        # the operator knows the first call latency includes the download.
-        log.warning("YOLOE weights missing at %s — will auto-download to "
-                    "~/.cache/torch/hub/ on first inference", model_path)
-        # Pass just the basename so ultralytics picks its own download path.
-        model_path = "yoloe-11l-seg-pf.pt"
+        return Err(
+            f"YOLOE weights not found at {model_path}. "
+            f"Either (a) the vendored checkpoint at {weights_default} "
+            f"was stripped from the clone (check `git status` — large "
+            f"files sometimes get filtered by sparse-checkout or "
+            f"workspace dedup) and a fresh `git pull` will fix it, or "
+            f"(b) you set config.model_path to a non-existent path."
+        )
     log.info("loading YOLOE: %s", model_path)
     try:
         from ultralytics import YOLOE  # noqa: E402

@@ -1,10 +1,18 @@
 # rbnx build artifacts
 rbnx-build/
 
-# YOLO weights — large, downloaded by ultralytics on first run.
-# If you ship a custom checkpoint, comment this out.
-yolo_world/weights/*.pt
+# YOLO weights — VENDORED in repo so deployment doesn't need internet.
+# The primary YOLOE 11-large prompt-free checkpoint
+# (yolo_world/weights/yoloe-11l-seg-pf.pt, ~71 MB) is committed; any
+# .engine TensorRT caches generated at runtime are NOT.
 yolo_world/weights/*.engine
+yolo_world/weights/*.onnx
+
+# Optional larger / alternative checkpoints the operator might drop
+# in for experimentation — keep them out of the repo (operator
+# manages via config.model_path):
+yolo_world/weights/yolov8*.pt
+yolo_world/weights/yoloe-11x-*.pt
 
 # saved annotated images (upstream node writes these in legacy path)
 yolo_world/_upstream/saved_image.jpg
