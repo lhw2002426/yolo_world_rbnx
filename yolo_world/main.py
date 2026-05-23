@@ -82,6 +82,19 @@ _ros_node = None
 _ros_thread: Optional[threading.Thread] = None
 _ros_stop_evt = threading.Event()
 
+# Synchronization between init() and _ros_thread_main:
+#   - _ros_ready_evt is set exactly once after the rclpy node has
+#     successfully created all of its publishers / subscribers /
+#     services, OR immediately after a setup-time exception is caught.
+#   - _ros_thread_error holds the exception (if any) so init() can
+#     propagate it to atlas as Err(...). Without this fail-fast path,
+#     a thread crash inside create_publisher (e.g. typesupport .so
+#     missing → "type_support is null") leaves the package looking
+#     ACTIVE on atlas while none of the ROS surfaces are actually up.
+_ros_ready_evt = threading.Event()
+_ros_thread_error: Optional[BaseException] = None
+_ROS_READY_TIMEOUT_S = 15.0
+
 
 # ── upstream-resolution helpers ─────────────────────────────────────────────
 _DEFAULT_TOPICS = {
@@ -260,81 +273,129 @@ def _back_project_3d(bbox_2d, depth_img, cam_info):
 # ── ROS bring-up (background thread) ────────────────────────────────────────
 def _ros_thread_main(rgb_topic: str, depth_topic: str, info_topic: str) -> None:
     """Subscribe + ROS service host + topic publishers, all in one rclpy
-    node. Stays alive for the lifetime of the package."""
+    node. Stays alive for the lifetime of the package.
+
+    Setup phase wrapped in try/except: any failure (typesupport .so
+    not loadable, intra-thread import error, rclpy.init failure,
+    etc.) is captured into _ros_thread_error so init() can return
+    Err(...) instead of falsely reporting Ok and leaving us "ACTIVE
+    but mute" on atlas. _ros_ready_evt is set in BOTH the success
+    and failure paths so init()'s wait() always returns within
+    _ROS_READY_TIMEOUT_S (or sooner).
+    """
     global _ros_node, _bridge
     global _latest_color_image, _latest_depth_image, _latest_camera_info
+    global _ros_thread_error
 
-    import rclpy                              # noqa: E402
-    from rclpy.node import Node               # noqa: E402
-    from sensor_msgs.msg import Image, CameraInfo  # noqa: E402
-    from cv_bridge import CvBridge            # noqa: E402
-    import message_filters                    # noqa: E402
-    # graspnet_msgs is vendored in src/ and built by colcon — overlay is
-    # sourced by start.sh before this module imports.
-    from graspnet_msgs.srv import ObjectDetectionRequest  # noqa: E402
-    from graspnet_msgs.msg import DetectedObject, DetectedObjects  # noqa: E402
+    node = None
+    try:
+        import rclpy                              # noqa: E402
+        from rclpy.node import Node               # noqa: E402
+        from sensor_msgs.msg import Image, CameraInfo  # noqa: E402
+        from cv_bridge import CvBridge            # noqa: E402
+        import message_filters                    # noqa: E402
+        # graspnet_msgs is vendored in src/ and built by colcon — overlay is
+        # sourced by start.sh before this module imports.
+        from graspnet_msgs.srv import ObjectDetectionRequest  # noqa: E402
+        from graspnet_msgs.msg import DetectedObject, DetectedObjects  # noqa: E402
 
-    rclpy.init(args=None)
-    _bridge = CvBridge()
-    node = Node("yolo_world_node")
-    _ros_node = node
+        rclpy.init(args=None)
+        _bridge = CvBridge()
+        node = Node("yolo_world_node")
+        _ros_node = node
 
-    # Synchronized RGB + depth + camera_info subscribers via message_filters.
-    sub_rgb   = message_filters.Subscriber(node, Image,      rgb_topic)
-    sub_depth = message_filters.Subscriber(node, Image,      depth_topic)
-    sub_info  = message_filters.Subscriber(node, CameraInfo, info_topic)
-    sync = message_filters.ApproximateTimeSynchronizer(
-        [sub_rgb, sub_depth, sub_info], queue_size=10, slop=0.1)
+        # Synchronized RGB + depth + camera_info subscribers via message_filters.
+        sub_rgb   = message_filters.Subscriber(node, Image,      rgb_topic)
+        sub_depth = message_filters.Subscriber(node, Image,      depth_topic)
+        sub_info  = message_filters.Subscriber(node, CameraInfo, info_topic)
+        sync = message_filters.ApproximateTimeSynchronizer(
+            [sub_rgb, sub_depth, sub_info], queue_size=10, slop=0.1)
 
-    def _camera_cb(rgb_msg, depth_msg, info_msg):
-        global _latest_color_image, _latest_depth_image, _latest_camera_info
+        def _camera_cb(rgb_msg, depth_msg, info_msg):
+            global _latest_color_image, _latest_depth_image, _latest_camera_info
+            try:
+                # `passthrough` keeps RGB as-is (Orbbec publishes rgb8 / 16UC1).
+                rgb   = _bridge.imgmsg_to_cv2(rgb_msg,   desired_encoding="passthrough")
+                depth = _bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
+            except Exception as e:  # noqa: BLE001
+                node.get_logger().error(f"camera_cb cv_bridge: {e}")
+                return
+            with _state_lock:
+                _latest_color_image = rgb
+                _latest_depth_image = depth
+                _latest_camera_info = info_msg
+        sync.registerCallback(_camera_cb)
+        log.info("subscribed: rgb=%s  depth=%s  info=%s",
+                 rgb_topic, depth_topic, info_topic)
+
+        # Compat ROS service (pick.py, yolo_grasp.py both call this).
+        def _ros_service_handler(request, response):
+            result = _detect_object(request.object_name)
+            response.success           = result["success"]
+            response.message           = result["message"]
+            response.bbox_2d           = list(result["bbox_2d"])
+            response.object_center_3d  = list(result["object_center_3d"])
+            response.confidence        = float(result["confidence"])
+            return response
+        node.create_service(ObjectDetectionRequest, "/yolo/detect_object",
+                            _ros_service_handler)
+        log.info("ROS service up: /yolo/detect_object")
+
+        # Compat publishers (kept for whoever subscribes — currently nobody
+        # critical, but the upstream node had them and removing changes the
+        # observable shape).
+        detection_image_pub = node.create_publisher(Image, "/yolo/detection_image", 10)
+        detected_objects_pub = node.create_publisher(
+            DetectedObjects, "/yolo/detect_objects", 10)
+        # Stash in module scope so periodic timer can reach them.
+        globals()["_detection_image_pub"]  = detection_image_pub
+        globals()["_detected_objects_pub"] = detected_objects_pub
+
+        # Periodic broadcast of all detected objects, 1 Hz (matches upstream).
+        node.create_timer(1.0, _periodic_broadcast)
+    except BaseException as e:  # noqa: BLE001 — must include SystemExit/KeyboardInterrupt etc.
+        # Setup-time failure. Most common cause in practice: graspnet_msgs
+        # typesupport .so files not on LD_LIBRARY_PATH, so create_publisher
+        # raises "type_support is null". Capture and signal init().
+        _ros_thread_error = e
+        log.error("rclpy thread setup failed: %s: %s",
+                  type(e).__name__, e, exc_info=True)
         try:
-            # `passthrough` keeps RGB as-is (Orbbec publishes rgb8 / 16UC1).
-            rgb   = _bridge.imgmsg_to_cv2(rgb_msg,   desired_encoding="passthrough")
-            depth = _bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
-        except Exception as e:  # noqa: BLE001
-            node.get_logger().error(f"camera_cb cv_bridge: {e}")
-            return
-        with _state_lock:
-            _latest_color_image = rgb
-            _latest_depth_image = depth
-            _latest_camera_info = info_msg
-    sync.registerCallback(_camera_cb)
-    log.info("subscribed: rgb=%s  depth=%s  info=%s",
-             rgb_topic, depth_topic, info_topic)
+            if node is not None:
+                node.destroy_node()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            import rclpy as _rclpy_for_shutdown
+            if _rclpy_for_shutdown.ok():
+                _rclpy_for_shutdown.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        _ros_ready_evt.set()
+        return
 
-    # Compat ROS service (pick.py, yolo_grasp.py both call this).
-    def _ros_service_handler(request, response):
-        result = _detect_object(request.object_name)
-        response.success           = result["success"]
-        response.message           = result["message"]
-        response.bbox_2d           = list(result["bbox_2d"])
-        response.object_center_3d  = list(result["object_center_3d"])
-        response.confidence        = float(result["confidence"])
-        return response
-    node.create_service(ObjectDetectionRequest, "/yolo/detect_object",
-                        _ros_service_handler)
-    log.info("ROS service up: /yolo/detect_object")
-
-    # Compat publishers (kept for whoever subscribes — currently nobody
-    # critical, but the upstream node had them and removing changes the
-    # observable shape).
-    detection_image_pub = node.create_publisher(Image, "/yolo/detection_image", 10)
-    detected_objects_pub = node.create_publisher(
-        DetectedObjects, "/yolo/detect_objects", 10)
-    # Stash in module scope so periodic timer can reach them.
-    globals()["_detection_image_pub"]  = detection_image_pub
-    globals()["_detected_objects_pub"] = detected_objects_pub
-
-    # Periodic broadcast of all detected objects, 1 Hz (matches upstream).
-    node.create_timer(1.0, _periodic_broadcast)
+    # Setup OK — let init() proceed.
+    _ros_ready_evt.set()
 
     # Spin until told to stop. We don't use rclpy.spin() because we want
     # to honor _ros_stop_evt for clean shutdown.
+    import rclpy  # noqa: E402  (re-import for the spin loop scope)
     while not _ros_stop_evt.is_set():
-        rclpy.spin_once(node, timeout_sec=0.1)
-    node.destroy_node()
-    rclpy.shutdown()
+        try:
+            rclpy.spin_once(node, timeout_sec=0.1)
+        except Exception as e:  # noqa: BLE001
+            # Per-iteration errors should NOT bring the whole thread down
+            # — that would silently re-introduce the "alive but mute"
+            # failure mode. Log and continue.
+            log.warning("rclpy.spin_once raised: %s", e)
+    try:
+        node.destroy_node()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        rclpy.shutdown()
+    except Exception:  # noqa: BLE001
+        pass
     log.info("rclpy thread exited")
 
 
@@ -443,9 +504,17 @@ def init(cfg):
     depth_topic = _resolve_topic("depth",       cfg)
     info_topic  = _resolve_topic("camera_info", cfg)
 
-    # 3. Spawn rclpy thread.
-    global _ros_thread
+    # 3. Spawn rclpy thread. We then BLOCK on _ros_ready_evt — the
+    # thread signals it after either successful setup of every
+    # publisher / subscriber / service, OR a setup-time exception
+    # (captured into _ros_thread_error). This makes init() fail-fast
+    # and propagate the error to atlas via Err(...), instead of
+    # returning Ok and leaving us "ACTIVE but mute" (the typesupport.so
+    # / LD_LIBRARY_PATH failure mode that was previously silent).
+    global _ros_thread, _ros_thread_error
     _ros_stop_evt.clear()
+    _ros_ready_evt.clear()
+    _ros_thread_error = None
     _ros_thread = threading.Thread(
         target=_ros_thread_main,
         args=(rgb_topic, depth_topic, info_topic),
@@ -454,11 +523,25 @@ def init(cfg):
     )
     _ros_thread.start()
 
-    # Brief settle so the subscribers are wired before we tell atlas
-    # we're alive (cb itself only sets globals, no atlas call, so a
-    # racey first detect just returns "camera data not available" and
-    # the caller retries).
-    time.sleep(0.5)
+    if not _ros_ready_evt.wait(timeout=_ROS_READY_TIMEOUT_S):
+        _ros_stop_evt.set()
+        _ros_thread.join(timeout=2.0)
+        return Err(
+            f"rclpy thread did not become ready within "
+            f"{_ROS_READY_TIMEOUT_S}s (likely blocked in rclpy.init or "
+            f"create_publisher; check `ps -T` and the log just above)"
+        )
+
+    if _ros_thread_error is not None:
+        err = _ros_thread_error
+        _ros_stop_evt.set()
+        _ros_thread.join(timeout=2.0)
+        return Err(
+            f"rclpy thread setup failed: {type(err).__name__}: {err} — "
+            f"if message mentions 'libgraspnet_msgs__rosidl_typesupport_*.so', "
+            f"the vendored graspnet_msgs lib/ is not on LD_LIBRARY_PATH "
+            f"(check scripts/start.sh's graspnet_msgs path injection)"
+        )
 
     with _state_lock:
         _initialized = True

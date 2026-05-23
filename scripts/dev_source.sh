@@ -128,11 +128,16 @@ _yolo_chain_source "$OVERLAY" || {
     return 1 2>/dev/null || exit 1
 }
 
-# ── Direct PYTHONPATH / AMENT_PREFIX_PATH injection for graspnet_msgs ──
+# ── Direct PYTHONPATH / AMENT_PREFIX_PATH / LD_LIBRARY_PATH injection ──
 # When the calling shell already has another colcon overlay sourced
 # (e.g. ~/.bashrc sources /home/…/tracing_ws/install/setup.bash),
 # colcon's idempotent prefix markers can make the source above silently
 # fail to add our overlay's paths. Inject them by hand to be sure.
+# Three paths: PYTHONPATH (for `import graspnet_msgs.srv`),
+# LD_LIBRARY_PATH (for the typesupport .so files dlopen()'d by rclpy
+# at create_publisher / create_subscription time — without this you
+# get "type_support is null" runtime crashes that look like the
+# package started OK), and AMENT_PREFIX_PATH (for ament_index lookups).
 # Idempotent — duplicates are skipped via the case-glob check.
 _GMSGS_PREFIX="${YOLO_WORLD_PKG}/rbnx-build/ws/install/graspnet_msgs"
 if [ -d "$_GMSGS_PREFIX" ]; then
@@ -153,6 +158,18 @@ if [ -d "$_GMSGS_PREFIX" ]; then
         fi
     done
     unset _site
+    for _libdir in \
+        "$_GMSGS_PREFIX"/lib \
+        "$_GMSGS_PREFIX"/local/lib
+    do
+        if [ -d "$_libdir" ]; then
+            case ":${LD_LIBRARY_PATH:-}:" in
+                *":${_libdir}:"*) ;;
+                *) export LD_LIBRARY_PATH="${_libdir}:${LD_LIBRARY_PATH:-}" ;;
+            esac
+        fi
+    done
+    unset _libdir
 fi
 unset _GMSGS_PREFIX
 
