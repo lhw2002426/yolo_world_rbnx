@@ -68,6 +68,11 @@ yolo_world = Service(
 _state_lock = threading.Lock()
 _initialized = False
 
+# Cached cfg dict from on_init — read by helpers like
+# _resolved_overlay_path() that run later (e.g. from the 1Hz timer).
+# Kept module-scope rather than threading state through every helper.
+_LATEST_CFG: dict[str, Any] = {}
+
 # Latest synchronized camera frame, captured by message_filters callback.
 _latest_color_image = None       # numpy ndarray, RGB
 _latest_depth_image = None       # numpy ndarray, depth in mm (uint16)
@@ -404,7 +409,13 @@ def _periodic_broadcast() -> None:
 
     Mirrors the upstream node's 1 Hz timer. Useful for visualisation
     tools subscribed to that topic; nothing in the grasp pipeline
-    consumes it directly."""
+    consumes it directly.
+
+    Side effect: also writes a debug overlay image
+    (RGB + bbox + label) to disk, overwriting the previous frame.
+    Default location is `<pkg>/data/last_detection.jpg`; override via
+    cfg.debug_overlay_path. Set cfg.debug_overlay_path="" to disable.
+    """
     pub = globals().get("_detected_objects_pub")
     if pub is None or _yolo_model is None:
         return
@@ -422,6 +433,8 @@ def _periodic_broadcast() -> None:
         if _ros_node is not None:
             msg.header.stamp = _ros_node.get_clock().now().to_msg()
             msg.header.frame_id = "camera_color_optical_frame"
+        # Collect (bbox, name, conf) tuples for both message + overlay.
+        annotations: list[tuple[list[float], str, float]] = []
         if det is not None and len(det.boxes) > 0:
             for i in range(len(det.boxes)):
                 conf = float(det.boxes.conf[i].cpu().numpy())
@@ -430,8 +443,9 @@ def _periodic_broadcast() -> None:
                 x1, y1, x2, y2 = det.boxes.xyxy[i].cpu().numpy()
                 bbox = [float(int(x1)), float(int(y1)),
                         float(int(x2)), float(int(y2))]
+                name = det.names[int(det.boxes.cls[i].cpu().numpy())]
                 obj = DetectedObject()
-                obj.object_name = det.names[int(det.boxes.cls[i].cpu().numpy())]
+                obj.object_name = name
                 obj.bbox_2d = bbox
                 obj.confidence = conf
                 if depth is not None and info is not None:
@@ -440,9 +454,112 @@ def _periodic_broadcast() -> None:
                 else:
                     obj.object_center_3d = []
                 msg.objects.append(obj)
+                annotations.append((bbox, name, conf))
         pub.publish(msg)
     except Exception as e:  # noqa: BLE001
         log.debug("periodic broadcast skipped: %s", e)
+        return
+
+    # ── debug overlay (best-effort; failure does NOT affect the
+    # publish above) ───────────────────────────────────────────────
+    overlay_path = _resolved_overlay_path()
+    if not overlay_path:
+        return
+    try:
+        _write_debug_overlay(rgb, annotations, overlay_path)
+    except Exception as e:  # noqa: BLE001
+        # Once-per-error rate-limited: at WARNING the first time so it's
+        # visible, then DEBUG so we don't spam the log on missing dirs
+        # / read-only fs / etc.
+        global _debug_overlay_warned
+        if not _debug_overlay_warned:
+            log.warning("debug overlay write failed (%s): %s — "
+                        "subsequent failures will be DEBUG-only",
+                        overlay_path, e)
+            _debug_overlay_warned = True
+        else:
+            log.debug("debug overlay write failed: %s", e)
+
+
+# Module-scope state for the overlay. Resolved lazily (cfg may not be
+# available at import time) and cached.
+_debug_overlay_path_cached: Optional[str] = None
+_debug_overlay_warned: bool = False
+
+
+def _resolved_overlay_path() -> str:
+    """Compute & cache the debug-overlay output path. Empty string
+    means "disabled"."""
+    global _debug_overlay_path_cached
+    if _debug_overlay_path_cached is not None:
+        return _debug_overlay_path_cached
+    cfg_val = _LATEST_CFG.get("debug_overlay_path")
+    if cfg_val is None:
+        # Default: <pkg>/data/last_detection.jpg
+        pkg_root = Path(os.environ.get(
+            "RBNX_PACKAGE_ROOT",
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+        ))
+        out = str(pkg_root / "data" / "last_detection.jpg")
+    else:
+        out = str(cfg_val)
+    _debug_overlay_path_cached = out
+    if out:
+        log.info("debug overlay enabled: %s", out)
+    return out
+
+
+def _write_debug_overlay(rgb, annotations, out_path: str) -> None:
+    """Render bbox + label on a copy of `rgb` and atomically write to
+    `out_path` (.jpg). Overwrites any previous file at that location.
+
+    `rgb` is what came out of cv_bridge in passthrough mode — for
+    Orbbec that's `rgb8`. cv2.imwrite expects BGR, so we color-swap.
+    Failure raises (caller logs)."""
+    import cv2 as _cv2  # noqa: E402
+    import numpy as _np  # noqa: E402
+
+    # Make output dir if needed (idempotent).
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    img = _np.ascontiguousarray(rgb)
+    # cv2 wants BGR; passthrough rgb8 needs the swap.
+    if img.ndim == 3 and img.shape[2] == 3:
+        img = _cv2.cvtColor(img, _cv2.COLOR_RGB2BGR)
+
+    for bbox, name, conf in annotations:
+        x1, y1, x2, y2 = (int(v) for v in bbox)
+        # Box.
+        _cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        # Label.
+        label = f"{name} {conf:.2f}"
+        (tw, th), _baseline = _cv2.getTextSize(
+            label, _cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        # Filled label background just above the box (or below if at top).
+        y_label_bottom = y1 if y1 - th - 4 >= 0 else y2 + th + 4
+        _cv2.rectangle(
+            img,
+            (x1, y_label_bottom - th - 4),
+            (x1 + tw + 4, y_label_bottom),
+            (0, 255, 0), thickness=_cv2.FILLED)
+        _cv2.putText(
+            img, label, (x1 + 2, y_label_bottom - 2),
+            _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, _cv2.LINE_AA)
+
+    # Overlay timestamp on the top-left for sanity-check that it's fresh.
+    ts = time.strftime("%H:%M:%S")
+    _cv2.putText(
+        img, ts, (8, 22),
+        _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, _cv2.LINE_AA)
+
+    # Atomic-ish write: cv2.imwrite to .tmp then rename.
+    tmp_path = out_path + ".tmp"
+    if not _cv2.imwrite(tmp_path, img,
+                        [int(_cv2.IMWRITE_JPEG_QUALITY), 80]):
+        raise RuntimeError(f"cv2.imwrite returned False for {tmp_path}")
+    os.replace(tmp_path, out_path)
 
 
 # ── lifecycle ───────────────────────────────────────────────────────────────
@@ -464,6 +581,11 @@ def init(cfg):
             cfg = json.loads(cfg) if cfg else {}
         except json.JSONDecodeError as e:
             return Err(f"bad config_json: {e}")
+
+    # Stash for helpers that read cfg outside this function (e.g.
+    # _resolved_overlay_path called from the 1Hz timer).
+    global _LATEST_CFG
+    _LATEST_CFG = cfg
 
     # 1. Load YOLOE weights.
     #

@@ -1,0 +1,4 @@
+# Runtime artifacts written by yolo_world's debug overlay (see
+# yolo_world.main._write_debug_overlay). Don't version them.
+*.jpg
+*.jpg.tmp
