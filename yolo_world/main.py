@@ -485,6 +485,10 @@ def _periodic_broadcast() -> None:
 # available at import time) and cached.
 _debug_overlay_path_cached: Optional[str] = None
 _debug_overlay_warned: bool = False
+# Tracks whether we've already logged the "fell back to a different
+# encoder / file extension" notice — avoid spamming the log on every
+# 1Hz tick once we've settled on .png instead of .jpg.
+_debug_overlay_ext_announced: bool = False
 
 
 def _resolved_overlay_path() -> str:
@@ -511,11 +515,24 @@ def _resolved_overlay_path() -> str:
 
 def _write_debug_overlay(rgb, annotations, out_path: str) -> None:
     """Render bbox + label on a copy of `rgb` and atomically write to
-    `out_path` (.jpg). Overwrites any previous file at that location.
+    `out_path`. Overwrites any previous file at that location.
 
     `rgb` is what came out of cv_bridge in passthrough mode — for
-    Orbbec that's `rgb8`. cv2.imwrite expects BGR, so we color-swap.
-    Failure raises (caller logs)."""
+    Orbbec that's `rgb8`. cv2 expects BGR, so we color-swap before
+    drawing.
+
+    Encoder strategy (fall through on failure — some opencv builds
+    ship without libjpeg / libpng / etc.):
+        1. cv2.imencode(.<ext>) for whatever extension the operator
+           asked for via out_path — usually .jpg or .png.
+        2. cv2.imencode(.png) — png is bundled with virtually every
+           opencv build, jpeg is the one that's commonly missing in
+           server / headless wheels.
+        3. PIL (Pillow) — usually present alongside numpy in any
+           Python env that has cv_bridge.
+        4. Raw PPM — only depends on numpy + struct; unconditional
+           last-ditch.
+    Failure (all four) raises so the caller can log."""
     import cv2 as _cv2  # noqa: E402
     import numpy as _np  # noqa: E402
 
@@ -554,11 +571,102 @@ def _write_debug_overlay(rgb, annotations, out_path: str) -> None:
         img, ts, (8, 22),
         _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, _cv2.LINE_AA)
 
-    # Atomic-ish write: cv2.imwrite to .tmp then rename.
+    # Encode → bytes. Try the path's extension first, then PNG, then
+    # PIL, then raw PPM. This is necessary because some opencv-python
+    # builds (notably the ROS humble apt-installed one) ship without
+    # libjpeg, so cv2.imwrite("...jpg", img) fails with "could not
+    # find a writer for the specified extension".
+    _, requested_ext = os.path.splitext(out_path)
+    requested_ext = (requested_ext or ".png").lower()
+
+    encoded: Optional[bytes] = None
+    final_ext: str = requested_ext
+    encoder_used: str = ""
+
+    # Step 1: cv2.imencode at requested extension.
+    try:
+        ok, buf = _cv2.imencode(
+            requested_ext, img,
+            [int(_cv2.IMWRITE_JPEG_QUALITY), 80] if requested_ext in (".jpg", ".jpeg") else [])
+        if ok:
+            encoded = bytes(buf)
+            encoder_used = f"cv2.imencode({requested_ext})"
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Step 2: cv2.imencode(.png) — png is universally compiled in.
+    if encoded is None and requested_ext != ".png":
+        try:
+            ok, buf = _cv2.imencode(".png", img)
+            if ok:
+                encoded = bytes(buf)
+                final_ext = ".png"
+                encoder_used = "cv2.imencode(.png) [fallback]"
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Step 3: PIL.
+    if encoded is None:
+        try:
+            from PIL import Image as _PILImage  # noqa: E402
+            import io as _io                      # noqa: E402
+            # img is BGR (cv2 convention); flip back to RGB for PIL.
+            rgb_for_pil = img[:, :, ::-1] if (img.ndim == 3 and img.shape[2] == 3) else img
+            pil_img = _PILImage.fromarray(rgb_for_pil)
+            buf = _io.BytesIO()
+            pil_format = "PNG" if requested_ext != ".jpg" and requested_ext != ".jpeg" else "JPEG"
+            pil_img.save(buf, format=pil_format,
+                         quality=80 if pil_format == "JPEG" else None)
+            encoded = buf.getvalue()
+            final_ext = ".png" if pil_format == "PNG" else ".jpg"
+            encoder_used = f"PIL.{pil_format} [fallback]"
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Step 4: raw PPM (P6 binary). Unconditional last-ditch — only
+    # needs numpy + the file system. Ext switches to .ppm so any
+    # viewer auto-detects format from header instead of our extension.
+    if encoded is None:
+        try:
+            h, w = img.shape[:2]
+            if img.ndim == 3 and img.shape[2] == 3:
+                # Already BGR; PPM expects RGB, so swap back.
+                ppm_data = img[:, :, ::-1].tobytes()
+            else:
+                ppm_data = img.tobytes()
+            header = f"P6\n{w} {h}\n255\n".encode("ascii")
+            encoded = header + ppm_data
+            final_ext = ".ppm"
+            encoder_used = "raw PPM [last-ditch]"
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                f"all overlay encoders failed; last error: {e}") from e
+
+    # If the actual format we ended up with differs from requested,
+    # rewrite out_path to use the new extension. We do this once;
+    # subsequent calls go straight to the new path. We also cache
+    # this mapping so the operator's "I asked for .jpg" view of the
+    # path stays consistent with what's on disk.
+    if final_ext != requested_ext:
+        out_path = (
+            out_path[: -len(requested_ext)] + final_ext
+            if requested_ext else out_path + final_ext
+        )
+        global _debug_overlay_path_cached, _debug_overlay_ext_announced
+        _debug_overlay_path_cached = out_path
+        if not _debug_overlay_ext_announced:
+            log.warning(
+                "debug overlay encoder mismatch: requested %s, "
+                "wrote %s via %s. Future writes will go to %s. "
+                "(Install libjpeg / opencv-python with full codecs "
+                "to keep your requested extension.)",
+                requested_ext, final_ext, encoder_used, out_path)
+            _debug_overlay_ext_announced = True
+
+    # Atomic-ish write: write to .tmp then rename.
     tmp_path = out_path + ".tmp"
-    if not _cv2.imwrite(tmp_path, img,
-                        [int(_cv2.IMWRITE_JPEG_QUALITY), 80]):
-        raise RuntimeError(f"cv2.imwrite returned False for {tmp_path}")
+    with open(tmp_path, "wb") as f:
+        f.write(encoded)
     os.replace(tmp_path, out_path)
 
 

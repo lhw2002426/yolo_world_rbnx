@@ -1,4 +1,10 @@
 # Runtime artifacts written by yolo_world's debug overlay (see
 # yolo_world.main._write_debug_overlay). Don't version them.
-*.jpg
+last_detection.jpg
+last_detection.jpeg
+last_detection.png
+last_detection.ppm
 *.jpg.tmp
+*.jpeg.tmp
+*.png.tmp
+*.ppm.tmp
